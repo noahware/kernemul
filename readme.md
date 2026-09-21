@@ -90,6 +90,7 @@ examples:
 # Credits
 
 - [John](https://github.com/invpcid) for helping with bugs on EAC, ideas, and some function implementation handlers.
+- [Heinrich](https://github.com/nikgeneburn) for helping with anti-emulation on Unicorn.
 
 # License
 
