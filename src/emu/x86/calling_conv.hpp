@@ -12,6 +12,8 @@ struct x86_win_conv : calling_conv
 	// Reserved whether or not the caller uses it, so the fifth argument is the first on the stack.
 	static constexpr addr_t home_space_size = 0x20;
 
+	[[nodiscard]] std::size_t sp_spadow() const override { return home_space_size; }
+
 	// Relative to a stack pointer at the return address, which is where it points on entry.
 	static constexpr addr_t stack_arg_off(const std::size_t index)
 	{

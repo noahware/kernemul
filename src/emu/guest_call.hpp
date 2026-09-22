@@ -33,7 +33,12 @@ public:
 		for (std::size_t i = 0; i < regs.size(); ++i)
 			cpu.reg_read(regs[i], &saved[i], a->reg_size(regs[i]));
 
-		cpu.set_sp(scratch_base(cpu, scratch));
+		// Below the scratch rather than at it: the routine being called owns the shadow space
+		// above its return address and spills its arguments there before it reads anything.
+		// Starting it at the scratch base would put that space on top of whatever the caller
+		// built for it -- an exception record, whose first field is the code the handler then
+		// reads back as the low half of its own first argument.
+		cpu.set_sp(scratch_base(cpu, scratch) - conv.sp_spadow());
 		a->set_ret_addr(cpu, trampoline(cpu));
 
 		for (std::size_t i = 0; i < args.size(); ++i)

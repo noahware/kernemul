@@ -34,6 +34,12 @@ struct calling_conv
 	virtual void set_ret_addr(vcpu& cpu, thread& t, addr_t addr) const = 0;
 	virtual std::uint64_t read_ret(vcpu& cpu, const thread& t) const = 0;
 
+	// The shadow space: the bytes above a callee's return address that belong to the callee
+	// rather than to whoever called it, since it may spill its register arguments there before
+	// it does anything else. Building a call frame has to leave them clear of everything else
+	// in it.
+	[[nodiscard]] virtual std::size_t sp_spadow() const { return 0; }
+
 protected:
 	virtual void arg_read(vcpu& cpu, std::size_t index, void* buf, std::size_t size) const = 0;
 	virtual void ret_write(vcpu& cpu, const void* buf, std::size_t size) const = 0;
