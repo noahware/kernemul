@@ -169,6 +169,22 @@ void modules::register_ntoskrnl_token_ops(win_kernel_state& state, proc_module& 
 	auto* st = &state;
 	const auto tokens = std::make_shared<token_state>();
 
+	state.privilege_enabled = [st, tokens](vcpu& cpu, const std::uint32_t luid) -> bool
+	{
+		const auto found = resolve_token(*st, *tokens, cpu, current_effective_token_pseudo_handle, 0);
+
+		if (found.status != STATUS_SUCCESS)
+			return false;
+
+		std::scoped_lock lock(found.token->mtx);
+
+		return std::ranges::any_of(found.token->data.privileges,
+			[luid](const privilege_entry& p)
+			{
+				return p.luid == luid && (p.attributes & se_privilege_enabled);
+			});
+	};
+
 	const auto open_process_token = [st, tokens](vcpu& cpu, const std::uint64_t process_handle,
 		const std::uint32_t desired_access, const std::uint32_t handle_attributes,
 		emu_object<std::uint64_t> token_handle) -> NTSTATUS
