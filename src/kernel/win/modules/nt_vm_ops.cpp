@@ -1,4 +1,5 @@
 #include "nt_vm_ops.hpp"
+#include "../file_common.hpp"
 #include "../win_kernel.hpp"
 #include "../mdl.hpp"
 #include "../object_names.hpp"
@@ -11,6 +12,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <vector>
 
 namespace
@@ -217,6 +220,37 @@ std::uint32_t section_access_needed(const std::uint32_t view)
 	return needed;
 }
 
+constexpr std::uint32_t section_extend_size = 0x0010;
+
+// A data view that maps a section's pages directly, kept so a flush can find what to write back.
+struct shared_view
+{
+	std::shared_ptr<section_host> host;
+	std::uint64_t offset = 0;
+};
+
+using shared_view_key = std::pair<const win_user_mem*, addr_t>;
+
+shared_view_key view_key(const win_user_mem* const mem, const addr_t base)
+{
+	return { mem, base };
+}
+
+struct shared_view_table
+{
+	std::mutex mtx;
+	std::map<shared_view_key, shared_view> views;
+};
+
+// A request for more than this is refused rather than left to run the guest out of memory.
+constexpr std::uint64_t max_awe_pages = 0x100000;
+constexpr std::uint64_t max_write_watch_entries = 0x100000;
+constexpr std::int64_t min_paging_file_size = 256 * static_cast<std::int64_t>(mdl_page_size);
+constexpr std::size_t max_paging_files = 16;
+
+constexpr std::uint32_t se_lock_memory_privilege = 4;
+constexpr std::uint32_t se_create_pagefile_privilege = 15;
+
 constexpr std::uint32_t process_vm_operation = 0x0008;
 constexpr std::uint32_t process_vm_read = 0x0010;
 constexpr std::uint32_t process_vm_write = 0x0020;
@@ -289,31 +323,63 @@ vm_target resolve_target(win_kernel_state& state, vcpu& cpu, const std::uint64_t
 	return target;
 }
 
-// Data section pages live in guest physical memory, so a view in each process is the same bytes.
-addr_t section_backing(vcpu& cpu, section_host& host)
+std::uint64_t round_to_page(const std::uint64_t size)
 {
-	std::scoped_lock lock(host.phys_mtx);
+	return (size + mdl_page_size - 1) & ~static_cast<std::uint64_t>(mdl_page_size - 1);
+}
 
-	if (host.phys)
-		return host.phys;
+// Data section pages live in guest physical memory, so a view in each process is the same bytes.
+// The caller holds host.phys_mtx.
+void grow_section_backing(vcpu& cpu, section_host& host)
+{
+	const auto wanted = round_to_page(host.size);
+
+	if (host.backed >= wanted)
+		return;
 
 	auto& mmu = *cpu.curr_addr_space()->mmu_;
 
-	const auto size = (host.size + mdl_page_size - 1) & ~static_cast<std::uint64_t>(mdl_page_size - 1);
-	const auto pa = mmu.alloc_phys(size, prot_rw);
+	const auto added = wanted - host.backed;
+	const auto pa = mmu.alloc_phys(added, prot_rw);
 
 	if (host.file)
 	{
 		const auto data = host.file->data();
-		const auto copied = std::min<std::size_t>(size, data.size());
 
-		if (copied)
-			mmu.write_phys(pa, data.data(), copied);
+		if (data.size() > host.backed)
+		{
+			const auto copied = std::min<std::size_t>(added, data.size() - host.backed);
+			mmu.write_phys(pa, data.data() + host.backed, copied);
+		}
 	}
 
-	host.phys = pa;
+	host.extents.push_back({ pa, added });
+	host.backed = wanted;
+}
 
-	return pa;
+// The physical runs behind [offset, offset + size) of a section.
+std::vector<win::phys_run> section_runs(vcpu& cpu, section_host& host, const std::uint64_t offset,
+	const std::uint64_t size)
+{
+	std::scoped_lock lock(host.phys_mtx);
+
+	grow_section_backing(cpu, host);
+
+	std::vector<win::phys_run> runs;
+	std::uint64_t cursor = 0;
+
+	for (const auto& extent : host.extents)
+	{
+		const auto from = std::max(offset, cursor);
+		const auto to = std::min(offset + size, cursor + extent.size);
+
+		if (from < to)
+			runs.push_back({ extent.pa + (from - cursor), static_cast<std::size_t>(to - from) });
+
+		cursor += extent.size;
+	}
+
+	return runs;
 }
 
 }
@@ -322,6 +388,7 @@ addr_t section_backing(vcpu& cpu, section_host& host)
 void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod)
 {
 	auto* st = &state;
+	const auto shared_views = std::make_shared<shared_view_table>();
 
 	auto allocate = [st](vcpu& cpu, const std::uint64_t process_handle,
 		emu_object<addr_t> base_address, emu_object<std::uint64_t> region_size,
@@ -912,7 +979,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 
 	// A data view is the section's own pages; an image view is a copy laid out at its addresses.
 	state.redirect_ntzw(mod, "MapViewOfSection",
-		[st](vcpu& cpu, const std::uint64_t section_handle, const std::uint64_t process_handle,
+		[st, shared_views](vcpu& cpu, const std::uint64_t section_handle, const std::uint64_t process_handle,
 			emu_object<addr_t> base_address, [[maybe_unused]] const std::uint64_t zero_bits,
 			[[maybe_unused]] const std::uint64_t commit_size,
 			emu_object<std::int64_t> section_offset, emu_object<std::uint64_t> view_size,
@@ -968,17 +1035,22 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 					THREAD_LOG_WARN("NtMapViewOfSection: copy-on-write is not tracked, so a "
 						"write through this view reaches the section");
 
-				const auto pa = section_backing(cpu, *host);
+				const auto runs = section_runs(cpu, *host, offset, size);
 
 				// A requested base is rounded down to the allocation granularity.
 				addr_t at = base_address
 					? base_address.read() & ~static_cast<addr_t>(win::alloc_granularity - 1) : 0;
 				auto region = static_cast<std::size_t>(size);
 
-				const auto status = target.mem->map_view(at, region, pa + offset, win32_protect);
+				const auto status = target.mem->map_view(at, region, runs, win32_protect);
 
 				if (status != STATUS_SUCCESS)
 					return status;
+
+				{
+					std::scoped_lock lock(shared_views->mtx);
+					shared_views->views[view_key(target.mem, at)] = { host, offset };
+				}
 
 				if (base_address)
 					base_address.write(at);
@@ -1088,7 +1160,8 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		});
 
 	state.redirect_ntzw(mod, "UnmapViewOfSection",
-		[st](vcpu& cpu, const std::uint64_t process_handle, const addr_t base_address) -> NTSTATUS
+		[st, shared_views](vcpu& cpu, const std::uint64_t process_handle,
+			const addr_t base_address) -> NTSTATUS
 		{
 			const auto target = resolve_target(*st, cpu, process_handle, process_vm_operation);
 
@@ -1099,8 +1172,18 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			{
 				std::size_t region = 0;
 
+				// Any address in a view names it, so the view's own base has to be found first.
+				win::memory_basic_info info{};
+				const bool found = target.mem->query(base_address, info) == STATUS_SUCCESS;
+
 				if (target.mem->unmap_view(base_address, region) == STATUS_SUCCESS)
 				{
+					if (found)
+					{
+						std::scoped_lock lock(shared_views->mtx);
+						shared_views->views.erase(view_key(target.mem, info.allocation_base));
+					}
+
 					THREAD_LOG_INFO("NtUnmapViewOfSection(0x{:X}, process=0x{:X}): {} bytes",
 						base_address, process_handle, region);
 
@@ -1134,6 +1217,471 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 	state.redirect_ntzw(mod, "CreateSection", create_section);
 	state.redirect_ntzw(mod, "OpenSection", open_section);
 	state.redirect_ntzw(mod, "QuerySection", query_section);
+
+	// Only a file backed data section can grow, and growing it grows the file. A view that is
+	// already mapped keeps the size it was mapped with.
+	state.redirect_ntzw(mod, "ExtendSection",
+		[st](vcpu&, const std::uint64_t section_handle, emu_object<std::int64_t> new_size)
+			-> NTSTATUS
+		{
+			if (!new_size)
+				return STATUS_INVALID_PARAMETER;
+
+			const auto entry = st->sys_proc->handle_table().lookup_handle(section_handle);
+
+			if (!entry)
+				return STATUS_INVALID_HANDLE;
+
+			const auto host = st->objs.get_object<section_host>(entry->body_addr);
+
+			if (!host)
+				return STATUS_OBJECT_TYPE_MISMATCH;
+
+			if (!(entry->access & section_extend_size))
+				return STATUS_ACCESS_DENIED;
+
+			const auto requested = new_size.read();
+
+			if (requested < 0)
+				return STATUS_INVALID_PARAMETER;
+
+			if (host->is_image || !host->file)
+				return STATUS_SECTION_NOT_EXTENDED;
+
+			std::uint64_t size;
+
+			{
+				std::scoped_lock lock(host->phys_mtx);
+
+				if (static_cast<std::uint64_t>(requested) > host->size)
+				{
+					try
+					{
+						if (host->file->size() < static_cast<std::uint64_t>(requested))
+							host->file->resize(static_cast<std::size_t>(requested));
+					}
+					catch (const std::exception&)
+					{
+						return STATUS_INSUFFICIENT_RESOURCES;
+					}
+
+					host->size = static_cast<std::uint64_t>(requested);
+
+					// The pages the section already has stay as they are; the ones past them
+					// are added when a view first needs them.
+					emu_object<std::int64_t>(*st->sys_proc->addr_space(),
+						entry->body_addr + section_body_size_offset)
+						.write(static_cast<std::int64_t>(host->size));
+				}
+
+				size = host->size;
+			}
+
+			new_size.write(static_cast<std::int64_t>(size));
+
+			THREAD_LOG_INFO("NtExtendSection(0x{:X}, '{}', requested={}) -> {} bytes",
+				section_handle, host->path, requested, size);
+
+			return STATUS_SUCCESS;
+		});
+
+	// Pages here are never taken from a process, so a lock changes only what the next lock,
+	// unlock or free sees. SeLockMemoryPrivilege guards the physical memory form.
+	const auto lock_vm = [st](vcpu& cpu, const std::uint64_t process_handle,
+		emu_object<addr_t> base_address, emu_object<std::uint64_t> region_size,
+		const std::uint32_t map_type, const bool locking) -> NTSTATUS
+	{
+		const std::string_view who = locking ? "NtLockVirtualMemory" : "NtUnlockVirtualMemory";
+
+		const auto target = resolve_target(*st, cpu, process_handle, process_vm_operation);
+
+		if (target.status != STATUS_SUCCESS)
+			return target.status;
+
+		if (!base_address || !region_size)
+			return STATUS_INVALID_PARAMETER;
+
+		if (!map_type || (map_type & ~(win::vm_lock_working_set | win::vm_lock_physical)))
+			return STATUS_INVALID_PARAMETER;
+
+		if ((map_type & win::vm_lock_physical)
+			&& !(st->privilege_enabled && st->privilege_enabled(cpu, se_lock_memory_privilege)))
+			return STATUS_PRIVILEGE_NOT_HELD;
+
+		if (!target.mem)
+			return STATUS_NOT_SUPPORTED;
+
+		addr_t start = base_address.read();
+		auto region = static_cast<std::size_t>(region_size.read());
+
+		const auto status = locking
+			? target.mem->lock(start, region, map_type)
+			: target.mem->unlock(start, region, map_type);
+
+		if (status != STATUS_SUCCESS && status != STATUS_WAS_LOCKED)
+		{
+			THREAD_LOG_WARN("{}(0x{:X}, {} bytes, type={}): 0x{:X}", who, start, region,
+				map_type, static_cast<std::uint32_t>(status));
+			return status;
+		}
+
+		base_address.write(start);
+		region_size.write(region);
+
+		THREAD_LOG_INFO("{}(0x{:X}, {} bytes, type={}, process=0x{:X}) -> 0x{:X}", who, start,
+			region, map_type, process_handle, static_cast<std::uint32_t>(status));
+
+		return status;
+	};
+
+	state.redirect_ntzw(mod, "LockVirtualMemory",
+		[lock_vm](vcpu& cpu, const std::uint64_t process_handle, emu_object<addr_t> base_address,
+			emu_object<std::uint64_t> region_size, const std::uint32_t map_type) -> NTSTATUS
+		{
+			return lock_vm(cpu, process_handle, base_address, region_size, map_type, true);
+		});
+
+	state.redirect_ntzw(mod, "UnlockVirtualMemory",
+		[lock_vm](vcpu& cpu, const std::uint64_t process_handle, emu_object<addr_t> base_address,
+			emu_object<std::uint64_t> region_size, const std::uint32_t map_type) -> NTSTATUS
+		{
+			return lock_vm(cpu, process_handle, base_address, region_size, map_type, false);
+		});
+
+	// Writes a mapped file view's pages back to the file. Memory that has no file behind it has
+	// nothing to flush, and succeeds.
+	state.redirect_ntzw(mod, "FlushVirtualMemory",
+		[st, shared_views](vcpu& cpu, const std::uint64_t process_handle,
+			emu_object<addr_t> base_address, emu_object<std::uint64_t> region_size,
+			emu_object<_IO_STATUS_BLOCK> io_status_block) -> NTSTATUS
+		{
+			const auto target = resolve_target(*st, cpu, process_handle, process_vm_operation);
+
+			if (target.status != STATUS_SUCCESS)
+				return target.status;
+
+			if (!base_address || !region_size || !io_status_block)
+				return STATUS_INVALID_PARAMETER;
+
+			const auto requested = base_address.read();
+			const auto start = mdl_page_base(requested);
+
+			if (!target.mem)
+			{
+				base_address.write(start);
+				return finish(io_status_block, STATUS_SUCCESS);
+			}
+
+			win::memory_basic_info info{};
+
+			if (target.mem->query(start, info) != STATUS_SUCCESS || info.state == win::mem_free)
+				return STATUS_NOT_MAPPED_VIEW;
+
+			// Zero asks for the rest of the view, which here is the rest of what the page's
+			// protection run covers.
+			const auto asked = region_size.read();
+			const auto length = asked
+				? round_to_page(asked + (requested - start))
+				: info.region_size;
+
+			std::uint64_t flushed = 0;
+
+			if (info.type == win::mem_mapped)
+			{
+				shared_view view;
+
+				{
+					std::scoped_lock lock(shared_views->mtx);
+
+					if (const auto it = shared_views->views.find(
+							view_key(target.mem, info.allocation_base));
+						it != shared_views->views.end())
+						view = it->second;
+				}
+
+				if (view.host && view.host->file && !view.host->is_image)
+				{
+					const auto offset = view.offset + (start - info.allocation_base);
+					auto& host = *view.host;
+
+					std::scoped_lock lock(host.phys_mtx);
+
+					const auto file = host.file->data();
+					const auto in_section = host.size > offset ? host.size - offset : 0;
+					const auto in_file = file.size() > offset ? file.size() - offset : 0;
+					const auto count = std::min({ length, in_section, in_file });
+
+					auto& mmu = *cpu.curr_addr_space()->mmu_;
+					std::uint64_t cursor = 0;
+
+					for (const auto& extent : host.extents)
+					{
+						const auto from = std::max(offset, cursor);
+						const auto to = std::min(offset + count, cursor + extent.size);
+
+						if (from < to)
+							mmu.read_phys(extent.pa + (from - cursor), file.data() + from, to - from);
+
+						cursor += extent.size;
+					}
+
+					flushed = count;
+				}
+			}
+
+			base_address.write(start);
+			region_size.write(length);
+
+			THREAD_LOG_INFO("NtFlushVirtualMemory(0x{:X}, {} bytes, process=0x{:X}) -> {} bytes "
+				"written back", start, length, process_handle, flushed);
+
+			return finish(io_status_block, STATUS_SUCCESS, length);
+		});
+
+	// The memory itself is pages the process owns until it frees them; showing one at an
+	// address is NtMapUserPhysicalPages' job. The array receives page frame numbers.
+	state.redirect_ntzw(mod, "AllocateUserPhysicalPages",
+		[st](vcpu& cpu, const std::uint64_t process_handle, emu_object<std::uint64_t> number_of_pages,
+			const addr_t pfn_array) -> NTSTATUS
+		{
+			const auto target = resolve_target(*st, cpu, process_handle, process_vm_operation);
+
+			if (target.status != STATUS_SUCCESS)
+				return target.status;
+
+			if (!number_of_pages || !pfn_array)
+				return STATUS_INVALID_PARAMETER;
+
+			if (!(st->privilege_enabled && st->privilege_enabled(cpu, se_lock_memory_privilege)))
+				return STATUS_PRIVILEGE_NOT_HELD;
+
+			if (!target.mem)
+				return STATUS_NOT_SUPPORTED;
+
+			const auto count = number_of_pages.read();
+
+			if (!count)
+				return STATUS_INVALID_PARAMETER_2;
+
+			if (count > max_awe_pages)
+				return STATUS_INSUFFICIENT_RESOURCES;
+
+			const auto pages = target.mem->awe_allocate(static_cast<std::size_t>(count));
+
+			if (pages.empty())
+				return STATUS_NO_MEMORY;
+
+			auto& space = *cpu.curr_addr_space();
+
+			for (std::size_t i = 0; i < pages.size(); ++i)
+				emu_object<std::uint64_t>(space, pfn_array + i * sizeof(std::uint64_t))
+					.write(pages[i] / mdl_page_size);
+
+			THREAD_LOG_INFO("NtAllocateUserPhysicalPages(process=0x{:X}, {} page(s)) -> pfn 0x{:X}..",
+				process_handle, count, pages.front() / mdl_page_size);
+
+			return STATUS_SUCCESS;
+		});
+
+	// A null array takes whatever is mapped at the addresses away. The region must have been
+	// reserved with MEM_PHYSICAL.
+	state.redirect_ntzw(mod, "MapUserPhysicalPages",
+		[](vcpu& cpu, const addr_t virtual_address, const std::uint64_t number_of_pages,
+			const addr_t pfn_array) -> NTSTATUS
+		{
+			const auto mem = user_mem(cpu);
+
+			if (!mem)
+				return STATUS_NOT_SUPPORTED;
+
+			if (!number_of_pages || number_of_pages > max_awe_pages)
+				return STATUS_INVALID_PARAMETER_2;
+
+			std::vector<addr_t> pages;
+
+			if (pfn_array)
+			{
+				auto& space = *cpu.curr_addr_space();
+				pages.reserve(static_cast<std::size_t>(number_of_pages));
+
+				for (std::uint64_t i = 0; i < number_of_pages; ++i)
+					pages.push_back(emu_object<std::uint64_t>(space,
+						pfn_array + i * sizeof(std::uint64_t)).read() * mdl_page_size);
+			}
+
+			const auto status = mem->awe_map(virtual_address,
+				static_cast<std::size_t>(number_of_pages), pfn_array ? pages.data() : nullptr);
+
+			THREAD_LOG_INFO("NtMapUserPhysicalPages(0x{:X}, {} page(s), {}) -> 0x{:X}",
+				virtual_address, number_of_pages, pfn_array ? "map" : "unmap",
+				static_cast<std::uint32_t>(status));
+
+			return status;
+		});
+
+	state.redirect_ntzw(mod, "FreeUserPhysicalPages",
+		[st](vcpu& cpu, const std::uint64_t process_handle, emu_object<std::uint64_t> number_of_pages,
+			const addr_t pfn_array) -> NTSTATUS
+		{
+			const auto target = resolve_target(*st, cpu, process_handle, process_vm_operation);
+
+			if (target.status != STATUS_SUCCESS)
+				return target.status;
+
+			if (!number_of_pages || !pfn_array)
+				return STATUS_INVALID_PARAMETER;
+
+			if (!target.mem)
+				return STATUS_NOT_SUPPORTED;
+
+			const auto count = number_of_pages.read();
+
+			if (!count || count > max_awe_pages)
+				return STATUS_INVALID_PARAMETER_2;
+
+			auto& space = *cpu.curr_addr_space();
+			std::vector<addr_t> pages;
+			pages.reserve(static_cast<std::size_t>(count));
+
+			for (std::uint64_t i = 0; i < count; ++i)
+				pages.push_back(emu_object<std::uint64_t>(space,
+					pfn_array + i * sizeof(std::uint64_t)).read() * mdl_page_size);
+
+			std::size_t freed = 0;
+			const auto status = target.mem->awe_free(pages, freed);
+
+			// What was actually freed is reported back, as for a partial failure.
+			number_of_pages.write(freed);
+
+			THREAD_LOG_INFO("NtFreeUserPhysicalPages(process=0x{:X}, {} page(s)) -> {} freed",
+				process_handle, count, freed);
+
+			return status;
+		});
+
+	// Recording the file is all a paging file does here: nothing pages out, so no space is set
+	// aside for it. Naming a file that exists again changes its sizes, as the real call does.
+	const auto paging_files = std::make_shared<std::map<std::string, std::pair<std::int64_t, std::int64_t>>>();
+	const auto paging_files_mtx = std::make_shared<std::mutex>();
+
+	state.redirect_ntzw(mod, "CreatePagingFile",
+		[st, paging_files, paging_files_mtx](vcpu& cpu, emu_object<_UNICODE_STRING> page_file_name,
+			emu_object<std::int64_t> minimum_size, emu_object<std::int64_t> maximum_size,
+			const std::uint32_t priority) -> NTSTATUS
+		{
+			if (!(st->privilege_enabled && st->privilege_enabled(cpu, se_create_pagefile_privilege)))
+				return STATUS_PRIVILEGE_NOT_HELD;
+
+			if (!page_file_name || !minimum_size || !maximum_size)
+				return STATUS_INVALID_PARAMETER;
+
+			const auto name = narrow_wstring(win::read_unicode_string(page_file_name));
+
+			if (name.empty())
+				return STATUS_INVALID_PARAMETER_1;
+
+			const auto minimum = minimum_size.read();
+			const auto maximum = maximum_size.read();
+			constexpr std::int64_t page_mask = mdl_page_size - 1;
+
+			// The documented floors disagree with each other, so these are the kernel's own:
+			// whole pages, no smaller than 256 of them, and a maximum that is not below the minimum.
+			if (minimum < min_paging_file_size || (minimum & page_mask))
+				return STATUS_INVALID_PARAMETER_2;
+
+			if (maximum < minimum || (maximum & page_mask))
+				return STATUS_INVALID_PARAMETER_3;
+
+			const auto path = win_filesystem::normalize(name);
+
+			{
+				std::scoped_lock lock(*paging_files_mtx);
+
+				if (!paging_files->contains(path) && paging_files->size() >= max_paging_files)
+					return STATUS_INSUFFICIENT_RESOURCES;
+
+				(*paging_files)[path] = { minimum, maximum };
+			}
+
+			if (!st->fs.open(path))
+				st->fs.create(path);
+
+			THREAD_LOG_INFO("NtCreatePagingFile('{}', min={}, max={}, priority={})", name,
+				minimum, maximum, priority);
+
+			return STATUS_SUCCESS;
+		});
+
+	// A region reserved with MEM_WRITE_WATCH keeps track of which of its pages are written.
+	state.redirect_ntzw(mod, "GetWriteWatch",
+		[st](vcpu& cpu, const std::uint64_t process_handle, const std::uint32_t flags,
+			const addr_t base_address, const std::uint64_t region_size,
+			const addr_t user_address_array, emu_object<std::uint64_t> entries,
+			emu_object<std::uint32_t> granularity) -> NTSTATUS
+		{
+			const auto target = resolve_target(*st, cpu, process_handle, process_vm_operation);
+
+			if (target.status != STATUS_SUCCESS)
+				return target.status;
+
+			if (flags & ~win::write_watch_flag_reset)
+				return STATUS_INVALID_PARAMETER_2;
+
+			if (!entries || !granularity || !user_address_array || !region_size)
+				return STATUS_INVALID_PARAMETER;
+
+			const auto capacity = entries.read();
+
+			if (!capacity)
+				return STATUS_INVALID_PARAMETER;
+
+			if (!target.mem)
+				return STATUS_INVALID_PARAMETER;
+
+			std::vector<addr_t> pages;
+
+			const auto status = target.mem->get_write_watch(base_address,
+				static_cast<std::size_t>(region_size), (flags & win::write_watch_flag_reset) != 0,
+				static_cast<std::size_t>(std::min<std::uint64_t>(capacity, max_write_watch_entries)),
+				pages);
+
+			if (status != STATUS_SUCCESS)
+				return status;
+
+			auto& space = *cpu.curr_addr_space();
+
+			for (std::size_t i = 0; i < pages.size(); ++i)
+				emu_object<addr_t>(space, user_address_array + i * sizeof(addr_t)).write(pages[i]);
+
+			entries.write(pages.size());
+			granularity.write(static_cast<std::uint32_t>(mdl_page_size));
+
+			THREAD_LOG_INFO("NtGetWriteWatch(0x{:X}, {} bytes, flags=0x{:X}) -> {} written page(s)",
+				base_address, region_size, flags, pages.size());
+
+			return STATUS_SUCCESS;
+		});
+
+	state.redirect_ntzw(mod, "ResetWriteWatch",
+		[st](vcpu& cpu, const std::uint64_t process_handle, const addr_t base_address,
+			const std::uint64_t region_size) -> NTSTATUS
+		{
+			const auto target = resolve_target(*st, cpu, process_handle, process_vm_operation);
+
+			if (target.status != STATUS_SUCCESS)
+				return target.status;
+
+			if (!region_size || !target.mem)
+				return STATUS_INVALID_PARAMETER;
+
+			const auto status = target.mem->reset_write_watch(base_address,
+				static_cast<std::size_t>(region_size));
+
+			THREAD_LOG_INFO("NtResetWriteWatch(0x{:X}, {} bytes) -> 0x{:X}", base_address,
+				region_size, static_cast<std::uint32_t>(status));
+
+			return status;
+		});
 
 	const auto copy_virtual_memory = [st](vcpu& cpu, const std::uint64_t process_handle,
 		const addr_t remote_va, const addr_t local_va, const std::uint64_t size,
