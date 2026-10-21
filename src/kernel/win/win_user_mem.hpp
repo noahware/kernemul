@@ -7,6 +7,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <span>
+#include <vector>
 
 namespace win
 {
@@ -19,6 +22,14 @@ constexpr std::uint32_t mem_free     = 0x00010000;
 constexpr std::uint32_t mem_private  = 0x00020000;
 constexpr std::uint32_t mem_mapped   = 0x00040000;
 constexpr std::uint32_t mem_image    = 0x01000000;
+
+constexpr std::uint32_t mem_write_watch = 0x00200000;
+constexpr std::uint32_t mem_physical    = 0x00400000;
+
+constexpr std::uint32_t write_watch_flag_reset = 0x1;
+
+constexpr std::uint32_t vm_lock_working_set = 0x1;
+constexpr std::uint32_t vm_lock_physical    = 0x2;
 
 constexpr std::uint32_t page_noaccess          = 0x001;
 constexpr std::uint32_t page_readonly          = 0x002;
@@ -51,6 +62,13 @@ struct memory_basic_info
 
 static_assert(sizeof(memory_basic_info) == 0x30);
 
+// A run of contiguous guest physical pages that a view is built from.
+struct phys_run
+{
+	addr_t pa;
+	std::size_t size;
+};
+
 } // namespace win
 
 // pages that must fault on access (PAGE_GUARD, PAGE_NOACCESS) are left unmapped and resolved lazily
@@ -66,6 +84,23 @@ public:
 	NTSTATUS protect(addr_t& base, std::size_t& size, std::uint32_t new_prot,
 		std::uint32_t& old_prot);
 	NTSTATUS query(addr_t addr, win::memory_basic_info& info) const;
+
+	// VirtualLock and VirtualUnlock. Pages are never paged out here, so this only records the
+	// lock, which is what the return codes depend on.
+	NTSTATUS lock(addr_t& base, std::size_t& size, std::uint32_t map_type);
+	NTSTATUS unlock(addr_t& base, std::size_t& size, std::uint32_t map_type);
+
+	// Pages written since the region was allocated with MEM_WRITE_WATCH, or since they were last
+	// reset, ascending. At most max_entries come back, and only those are reset.
+	NTSTATUS get_write_watch(addr_t base, std::size_t size, bool reset, std::size_t max_entries,
+		std::vector<addr_t>& pages);
+	NTSTATUS reset_write_watch(addr_t base, std::size_t size);
+
+	// Address Windowing Extensions. A page is owned by the process until it is freed, and shows
+	// at an address only while mapped into a MEM_PHYSICAL reservation.
+	std::vector<addr_t> awe_allocate(std::size_t count);
+	NTSTATUS awe_free(std::span<const addr_t> pages, std::size_t& freed);
+	NTSTATUS awe_map(addr_t base, std::size_t count, const addr_t* pages);
 
 	addr_t alloc_pages(std::size_t size, std::uint32_t prot = win::page_readwrite);
 
@@ -85,6 +120,8 @@ public:
 
 	// Maps physical pages a section owns, so every process that maps it sees the same bytes.
 	NTSTATUS map_view(addr_t& base, std::size_t& size, addr_t pa, std::uint32_t prot);
+	NTSTATUS map_view(addr_t& base, std::size_t& size, std::span<const win::phys_run> runs,
+		std::uint32_t prot);
 	NTSTATUS unmap_view(addr_t base, std::size_t& size);
 
 	void register_image(addr_t base, std::size_t size);
@@ -105,6 +142,12 @@ private:
 		std::uint32_t initial_prot;
 		std::uint32_t type;
 		std::map<addr_t, committed_region> committed;
+
+		// MEM_WRITE_WATCH: pages stay read-only until written, so the first write faults and is
+		// recorded here. MEM_PHYSICAL: nothing is committed; AWE pages are mapped in by hand.
+		bool write_watch = false;
+		bool physical = false;
+		std::set<addr_t> dirty;
 	};
 
 	using committed_map = std::map<addr_t, committed_region>;
@@ -120,6 +163,10 @@ private:
 
 	NTSTATUS commit_into(reservation_map::iterator res, addr_t base, std::size_t size, std::uint32_t prot);
 	addr_t pick_base(std::size_t size, std::size_t alignment);
+
+	[[nodiscard]] mem_prot watched_prot(const reservation& res, addr_t page, std::uint32_t prot) const;
+	void rewatch(reservation& res, addr_t page);
+	void awe_unmap_range(addr_t base, std::size_t size);
 
 	void map_pages(addr_t base, std::size_t size, std::uint32_t prot);
 	void evict_pages(addr_t base, std::size_t size);
@@ -141,5 +188,10 @@ private:
 	reservation_map reservations_;
 	// kept alive while their virtual page is unmapped, so arming a guard page does not discard them
 	std::map<addr_t, addr_t> backing_;
+	// page -> the MapType bits it is locked with
+	std::map<addr_t, std::uint32_t> locked_;
+	std::set<addr_t> awe_owned_;
+	std::vector<addr_t> awe_free_;
+	std::map<addr_t, addr_t> awe_mapped_;
 	mutable std::mutex mtx_;
 };
