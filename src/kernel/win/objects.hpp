@@ -98,8 +98,17 @@ struct section_host final : win_object
 	std::vector<std::uint8_t> image;
 
 	// The pages every view of a data section maps, allocated when it is first mapped so that a
-	// write through one view is the same write through another.
-	addr_t phys = 0;
+	// write through one view is the same write through another. They are a list because a
+	// section can grow: pages already handed to views stay where they are, and the new ones
+	// follow as another run.
+	struct extent
+	{
+		addr_t pa;
+		std::uint64_t size;
+	};
+
+	std::vector<extent> extents;
+	std::uint64_t backed = 0;
 	std::mutex phys_mtx;
 };
 

@@ -31,7 +31,7 @@ constexpr std::uint32_t mandatory_policy = 3;
 constexpr std::uint32_t elevation_default = 1;
 
 constexpr std::uint32_t default_privileges[] = {
-	5, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 22, 23, 24, 25, 28, 29, 30, 33, 34, 35, 36,
+	4, 5, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 22, 23, 24, 25, 28, 29, 30, 33, 34, 35, 36,
 };
 
 bytes u32(const std::uint32_t value)
