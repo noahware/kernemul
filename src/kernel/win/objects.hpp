@@ -33,6 +33,7 @@ struct file_host final : win_object
 	bool dir_started = false;
 
 	std::uint32_t ea_scan = 0;
+	std::uint32_t quota_scan = 0;
 
 	[[nodiscard]] bool is_device() const noexcept { return device_object != 0; }
 };

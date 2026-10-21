@@ -1198,6 +1198,54 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 			return result.status;
 		});
 	state.redirect_ntzw(mod, "FlushBuffersFile", flush_buffers_file);
+
+	// The store is memory, so every flavour of flush is the same nothing; what is left of the call
+	// is the argument checking, which is the part a caller can observe.
+	state.redirect_ntzw(mod, "FlushBuffersFileEx",
+		[st](vcpu&, const std::uint64_t file_handle, const std::uint32_t flags,
+			const addr_t parameters, const std::uint32_t parameters_size,
+			emu_object<_IO_STATUS_BLOCK> io_status_block) -> NTSTATUS
+		{
+			constexpr std::uint32_t flush_file_data_only = 0x1;
+			constexpr std::uint32_t flush_no_sync = 0x2;
+			constexpr std::uint32_t flush_file_data_sync_only = 0x4;
+			constexpr std::uint32_t file_write_data = 0x2;
+			constexpr std::uint32_t file_append_data = 0x4;
+
+			if (!io_status_block)
+				return STATUS_INVALID_PARAMETER;
+
+			// Nothing is defined for the parameter block yet, so any is refused.
+			if (parameters || parameters_size
+				|| (flags & ~(flush_file_data_only | flush_no_sync | flush_file_data_sync_only)))
+				return finish(io_status_block, STATUS_INVALID_PARAMETER);
+
+			const auto entry = st->sys_proc->handle_table().lookup_handle(file_handle);
+
+			if (!entry)
+				return finish(io_status_block, STATUS_INVALID_HANDLE);
+
+			if (st->sys_proc->handle_table().get_object<pipe_host>(file_handle))
+				return finish(io_status_block, STATUS_SUCCESS);
+
+			const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+
+			if (!host)
+				return finish(io_status_block, STATUS_INVALID_HANDLE);
+
+			// The console is handed out with no access recorded, and is not a file to write back.
+			if (!host->console && !(entry->access & (file_write_data | file_append_data)))
+				return finish(io_status_block, STATUS_ACCESS_DENIED);
+
+			// Flushing only what is needed to read the data back has no meaning for a directory.
+			if ((flags & flush_file_data_sync_only) && host->directory)
+				return finish(io_status_block, STATUS_INVALID_PARAMETER);
+
+			THREAD_LOG_INFO("NtFlushBuffersFileEx('{}', flags=0x{:X}): the store is memory, so "
+				"there is nothing to flush", host->path, flags);
+
+			return finish(io_status_block, STATUS_SUCCESS);
+		});
 	state.redirect_ntzw(mod, "QueryVolumeInformationFile", query_volume_information_file);
 
 	state.redirect_ntzw(mod, "QueryAttributesFile",

@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -61,6 +63,8 @@ namespace
 		case 12: return 0x0C;
 		case 37: return 0x68;
 		case 38: return 0x50;
+		case 60: return 0x58;
+		case 63: return 0x72;
 		default: return 0;
 		}
 	}
@@ -87,6 +91,11 @@ namespace
 			put<std::uint32_t>(out, 0x38, item.is_directory ? file_attribute_directory : file_attribute_normal);
 			put<std::uint32_t>(out, 0x3C, name_bytes);
 		}
+
+		// The extended classes carry a 128 bit file id where the others have a 64 bit one, and a
+		// caller reads a zero id as the file system having none to give.
+		if (info_class == 60 || info_class == 63)
+			put<std::uint64_t>(out, 0x48, static_cast<std::uint64_t>(index) + 1);
 
 		std::memcpy(out.data() + name_offset, wide.data(), name_bytes);
 
@@ -308,11 +317,267 @@ namespace
 
 		return out;
 	}
+
+	// FILE_QUOTA_INFORMATION keeps its sid after 0x28 bytes of fixed fields; the request list,
+	// FILE_GET_QUOTA_INFORMATION, keeps it after the offset and length alone.
+	constexpr std::size_t quota_entry_header = 0x28;
+	constexpr std::size_t quota_request_header = 0x8;
+	constexpr std::uint32_t file_write_data_access = 0x0002;
+
+	struct quota_entry
+	{
+		std::vector<std::uint8_t> sid;
+		std::int64_t change_time = 0;
+		std::int64_t used = 0;
+		std::int64_t threshold = -1;
+		std::int64_t limit = -1;
+	};
+
+	// Quotas belong to a volume rather than to a file, so every handle on the volume sees the
+	// one table. It is kept ordered by sid, which is what a scan with a start sid walks.
+	struct quota_state
+	{
+		std::mutex mtx;
+		std::map<std::string, std::vector<quota_entry>> volumes;
+	};
+
+	std::string volume_of(const std::string& path)
+	{
+		return path.substr(0, path.find('/'));
+	}
+
+	// The size of the sid at `at` if one that well formed fits in `available` bytes, else zero.
+	std::size_t sid_size_at(const std::vector<std::uint8_t>& raw, const std::size_t at,
+		const std::size_t available)
+	{
+		if (available < 8 || raw[at] != 1 || raw[at + 1] > 15)
+			return 0;
+
+		const std::size_t size = 8 + 4 * std::size_t{raw[at + 1]};
+
+		return size <= available ? size : 0;
+	}
+
+	// Walks a chain of entries linked by NextEntryOffset, collecting where each one's sid is.
+	bool walk_quota_chain(const std::vector<std::uint8_t>& raw, const std::size_t sid_offset,
+		std::vector<std::pair<std::size_t, std::size_t>>& sids)
+	{
+		std::size_t at = 0;
+
+		for (;;)
+		{
+			if (at + sid_offset > raw.size())
+				return false;
+
+			std::uint32_t next = 0;
+			std::uint32_t sid_length = 0;
+			std::memcpy(&next, raw.data() + at, sizeof(next));
+			std::memcpy(&sid_length, raw.data() + at + 4, sizeof(sid_length));
+
+			if (sid_length < 8 || sid_length > raw.size() - at - sid_offset
+				|| sid_size_at(raw, at + sid_offset, sid_length) != sid_length)
+				return false;
+
+			sids.emplace_back(at + sid_offset, sid_length);
+
+			if (!next)
+				return true;
+
+			if (next % 4 || next < sid_offset + sid_length || next >= raw.size() - at)
+				return false;
+
+			at += next;
+		}
+	}
+
+	NTSTATUS query_quota(win_kernel_state& state, quota_state& quotas, vcpu& cpu,
+		const std::uint64_t file_handle, emu_object<_IO_STATUS_BLOCK> io_status_block,
+		const addr_t buffer, const std::uint32_t length, const bool single,
+		const addr_t sid_list, const std::uint32_t sid_list_length, const addr_t start_sid,
+		const bool restart)
+	{
+		const auto host = state.sys_proc->handle_table().get_object<file_host>(file_handle);
+
+		if (!host)
+			return finish(io_status_block, STATUS_INVALID_HANDLE);
+
+		// Anything that is not a file on a volume has no quotas to speak of.
+		if (host->is_device() || host->console)
+			return finish(io_status_block, STATUS_INVALID_DEVICE_REQUEST);
+
+		if (!buffer || !length)
+			return finish(io_status_block, STATUS_BUFFER_TOO_SMALL);
+
+		auto& space = *cpu.curr_addr_space();
+
+		const bool by_list = sid_list && sid_list_length;
+		std::vector<std::vector<std::uint8_t>> wanted;
+		std::vector<std::uint8_t> start;
+
+		if (by_list)
+		{
+			std::vector<std::uint8_t> raw(sid_list_length);
+			space.read_mem(sid_list, raw.data(), raw.size());
+
+			std::vector<std::pair<std::size_t, std::size_t>> sids;
+
+			if (!walk_quota_chain(raw, quota_request_header, sids))
+				return finish(io_status_block, STATUS_QUOTA_LIST_INCONSISTENT);
+
+			for (const auto& [at, size] : sids)
+				wanted.emplace_back(raw.begin() + static_cast<std::ptrdiff_t>(at),
+					raw.begin() + static_cast<std::ptrdiff_t>(at + size));
+		}
+		else if (start_sid)
+		{
+			std::vector<std::uint8_t> raw(8);
+			space.read_mem(start_sid, raw.data(), raw.size());
+
+			if (raw[0] != 1 || raw[1] > 15)
+				return finish(io_status_block, STATUS_INVALID_SID);
+
+			start.resize(8 + 4 * std::size_t{raw[1]});
+			space.read_mem(start_sid, start.data(), start.size());
+		}
+
+		std::scoped_lock lock(quotas.mtx);
+
+		const auto& table = quotas.volumes[volume_of(host->path)];
+
+		std::vector<const quota_entry*> selected;
+		std::size_t begin = 0;
+
+		if (by_list)
+		{
+			for (const auto& sid : wanted)
+			{
+				const auto found = std::ranges::find(table, sid, &quota_entry::sid);
+
+				if (found != table.end())
+					selected.push_back(&*found);
+			}
+		}
+		else
+		{
+			begin = restart ? 0 : host->quota_scan;
+
+			if (!start.empty())
+				begin = static_cast<std::size_t>(std::ranges::lower_bound(table, start, {},
+					&quota_entry::sid) - table.begin());
+
+			for (std::size_t i = begin; i < table.size(); ++i)
+				selected.push_back(&table[i]);
+		}
+
+		if (selected.empty())
+			return finish(io_status_block, STATUS_NO_MORE_ENTRIES);
+
+		std::uint64_t written = 0;
+		std::uint64_t last_start = 0;
+		std::uint64_t last_size = 0;
+		std::size_t count = 0;
+
+		for (const auto* const item : selected)
+		{
+			const auto size = quota_entry_header + item->sid.size();
+
+			if (written + size > length)
+			{
+				if (!count)
+					return finish(io_status_block, STATUS_BUFFER_TOO_SMALL);
+
+				break;
+			}
+
+			std::vector<std::uint8_t> out(size);
+			put<std::uint32_t>(out, 4, static_cast<std::uint32_t>(item->sid.size()));
+			put<std::int64_t>(out, 0x08, item->change_time);
+			put<std::int64_t>(out, 0x10, item->used);
+			put<std::int64_t>(out, 0x18, item->threshold);
+			put<std::int64_t>(out, 0x20, item->limit);
+			std::ranges::copy(item->sid, out.begin() + static_cast<std::ptrdiff_t>(quota_entry_header));
+
+			space.write_mem(buffer + written, out.data(), out.size());
+
+			if (count)
+				space.write_mem<std::uint32_t>(buffer + last_start,
+					static_cast<std::uint32_t>(written - last_start));
+
+			last_start = written;
+			last_size = size;
+			written += (size + 7) & ~std::size_t{7};
+			++count;
+
+			if (single)
+				break;
+		}
+
+		if (!by_list)
+			host->quota_scan = static_cast<std::uint32_t>(begin + count);
+
+		return finish(io_status_block, STATUS_SUCCESS, last_start + last_size);
+	}
+
+	NTSTATUS set_quota(win_kernel_state& state, quota_state& quotas, vcpu& cpu,
+		const std::uint64_t file_handle, emu_object<_IO_STATUS_BLOCK> io_status_block,
+		const addr_t buffer, const std::uint32_t length)
+	{
+		const auto entry = state.sys_proc->handle_table().lookup_handle(file_handle);
+		const auto host = state.sys_proc->handle_table().get_object<file_host>(file_handle);
+
+		if (!entry || !host)
+			return finish(io_status_block, STATUS_INVALID_HANDLE);
+
+		if (host->is_device() || host->console)
+			return finish(io_status_block, STATUS_INVALID_DEVICE_REQUEST);
+
+		if (!(entry->access & file_write_data_access))
+			return finish(io_status_block, STATUS_ACCESS_DENIED);
+
+		if (!buffer || !length)
+			return finish(io_status_block, STATUS_INVALID_PARAMETER);
+
+		std::vector<std::uint8_t> raw(length);
+		cpu.curr_addr_space()->read_mem(buffer, raw.data(), raw.size());
+
+		std::vector<std::pair<std::size_t, std::size_t>> sids;
+
+		// All of the buffer is checked before any of it is applied.
+		if (!walk_quota_chain(raw, quota_entry_header, sids))
+			return finish(io_status_block, STATUS_QUOTA_LIST_INCONSISTENT);
+
+		std::scoped_lock lock(quotas.mtx);
+
+		auto& table = quotas.volumes[volume_of(host->path)];
+		const auto now = static_cast<std::int64_t>(win_system_time());
+
+		for (const auto& [sid_at, sid_size] : sids)
+		{
+			std::vector<std::uint8_t> sid(raw.begin() + static_cast<std::ptrdiff_t>(sid_at),
+				raw.begin() + static_cast<std::ptrdiff_t>(sid_at + sid_size));
+
+			auto at = std::ranges::lower_bound(table, sid, {}, &quota_entry::sid);
+
+			if (at == table.end() || at->sid != sid)
+				at = table.insert(at, quota_entry{ .sid = std::move(sid), .change_time = now,
+					.used = 0 });
+
+			// What a caller says it has used is the file system's to count, not the caller's.
+			std::memcpy(&at->threshold, raw.data() + sid_at - quota_entry_header + 0x18,
+				sizeof(at->threshold));
+			std::memcpy(&at->limit, raw.data() + sid_at - quota_entry_header + 0x20,
+				sizeof(at->limit));
+			at->change_time = now;
+		}
+
+		return finish(io_status_block, STATUS_SUCCESS);
+	}
 }
 
 void modules::register_ntoskrnl_file_ops(win_kernel_state& state, proc_module& mod)
 {
 	auto* st = &state;
+	const auto quotas = std::make_shared<quota_state>();
 
 	state.redirect_ntzw(mod, "QueryDirectoryFile",
 		[st](vcpu& cpu, const std::uint64_t file_handle, const std::uint64_t event,
@@ -476,6 +741,27 @@ void modules::register_ntoskrnl_file_ops(win_kernel_state& state, proc_module& m
 					length, byte_offset);
 			});
 	}
+
+	// Every volume has quotas turned on, because nothing here can turn them on or off, and a
+	// volume starts with no entries -- so a scan finds nothing until something sets a limit.
+	state.redirect_ntzw(mod, "QueryQuotaInformationFile",
+		[st, quotas](vcpu& cpu, const std::uint64_t file_handle,
+			emu_object<_IO_STATUS_BLOCK> io_status_block, const addr_t buffer,
+			const std::uint32_t length, const bool return_single_entry, const addr_t sid_list,
+			const std::uint32_t sid_list_length, const addr_t start_sid,
+			const bool restart_scan) -> NTSTATUS
+		{
+			return query_quota(*st, *quotas, cpu, file_handle, io_status_block, buffer, length,
+				return_single_entry, sid_list, sid_list_length, start_sid, restart_scan);
+		});
+
+	state.redirect_ntzw(mod, "SetQuotaInformationFile",
+		[st, quotas](vcpu& cpu, const std::uint64_t file_handle,
+			emu_object<_IO_STATUS_BLOCK> io_status_block, const addr_t buffer,
+			const std::uint32_t length) -> NTSTATUS
+		{
+			return set_quota(*st, *quotas, cpu, file_handle, io_status_block, buffer, length);
+		});
 
 	state.redirect_ntzw(mod, "SetEaFile",
 		[st](vcpu& cpu, const std::uint64_t file_handle,
