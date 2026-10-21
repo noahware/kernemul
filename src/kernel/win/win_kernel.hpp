@@ -29,6 +29,7 @@
 #include "../../target.hpp"
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -54,6 +55,10 @@ struct win_kernel_state : kernel_state
 	guest_caller calls;
 
 	std::unordered_map<addr_t, std::uint64_t> views;
+
+	// Whether the calling thread's effective token holds a privilege, by LUID, and has it
+	// enabled. Installed by the token module, which owns the tokens.
+	std::function<bool(vcpu&, std::uint32_t)> privilege_enabled;
 
 	std::int64_t boot_time = static_cast<std::int64_t>(win_system_time());
 
