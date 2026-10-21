@@ -242,6 +242,16 @@ private:
 	std::unordered_map<addr_t, gate> gates_;
 };
 
+// KEVENT_PAIR: a type and size, then two synchronization events, one for each side of the pair.
+constexpr std::size_t event_pair_body_size = 0x38;
+constexpr std::size_t event_pair_low_offset = 0x08;
+constexpr std::size_t event_pair_high_offset = 0x20;
+
+struct event_pair_host final : win_object
+{
+	std::string name;
+};
+
 std::string attribute_name(vcpu& cpu, const emu_object<_OBJECT_ATTRIBUTES>& object_attributes)
 {
 	auto& space = *cpu.curr_addr_space();
@@ -757,5 +767,290 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 			const bool alertable, emu_object<std::int64_t> timeout) -> NTSTATUS
 		{
 			return rendezvous(cpu, handle, key, alertable, timeout, true);
+		});
+
+	// Named the same way a keyed event is made, so the name it was made under finds it.
+	state.redirect_ntzw(mod, "OpenKeyedEvent",
+		[st](vcpu& cpu, emu_object<std::uint64_t> keyed_event_handle,
+			const std::uint32_t desired_access,
+			emu_object<_OBJECT_ATTRIBUTES> object_attributes) -> NTSTATUS
+		{
+			if (!keyed_event_handle)
+				return STATUS_INVALID_PARAMETER;
+
+			keyed_event_handle.write(0);
+
+			const auto name = attribute_name(cpu, object_attributes);
+
+			if (name.empty())
+				return STATUS_OBJECT_PATH_SYNTAX_BAD;
+
+			const auto existing = st->objs.lookup_named_object(name);
+
+			if (!existing)
+				return STATUS_OBJECT_NAME_NOT_FOUND;
+
+			if (!st->objs.get_object<keyed_event_host>(existing))
+				return STATUS_OBJECT_TYPE_MISMATCH;
+
+			const auto handle = st->sys_proc->handle_table().create_handle(existing, desired_access);
+
+			if (!handle)
+				return STATUS_INSUFFICIENT_RESOURCES;
+
+			keyed_event_handle.write(handle);
+
+			THREAD_LOG_INFO("NtOpenKeyedEvent('{}') -> handle=0x{:X}", name, handle);
+
+			return STATUS_SUCCESS;
+		});
+
+	// Sets the event and lets go whoever is waiting, then takes the signal back: a thread that
+	// starts waiting afterwards is not released. A notification event frees every waiter it has;
+	// a synchronization event frees one.
+	state.redirect_ntzw(mod, "PulseEvent",
+		[st](vcpu& cpu, const std::uint64_t event_handle,
+			emu_object<std::int32_t> previous_state) -> NTSTATUS
+		{
+			const auto found = resolve(*st, event_handle, win::event_notification_object,
+				"NtPulseEvent");
+
+			if (!found.address)
+				return STATUS_INVALID_HANDLE;
+
+			auto& space = *cpu.curr_addr_space();
+			const emu_object<_KEVENT> event(space, found.address);
+
+			const auto previous = win::signal_state(event);
+
+			win::set_signal_state(event, 1);
+			st->sys_proc->wake_waiters(space, event.address());
+			win::set_signal_state(event, 0);
+
+			if (previous_state)
+				previous_state.write(previous);
+
+			THREAD_LOG_INFO("NtPulseEvent(0x{:X}, '{}') -> was {}",
+				event_handle, found.host->name, previous);
+
+			return STATUS_SUCCESS;
+		});
+
+	auto make_event_pair = [st](vcpu& cpu, emu_object<std::uint64_t> event_pair_handle,
+		const std::uint32_t desired_access,
+		emu_object<_OBJECT_ATTRIBUTES> object_attributes) -> NTSTATUS
+	{
+		if (!event_pair_handle)
+			return STATUS_INVALID_PARAMETER;
+
+		const auto name = resolve_object_name(*st, cpu, object_attributes);
+
+		if (name.status != STATUS_SUCCESS)
+			return name.status;
+
+		const auto inherit = (name.attributes & obj_inherit) ? win_handle_table::flag_inherit : 0;
+
+		if (name.named())
+		{
+			if (const auto existing = st->objs.lookup_named_object(name.key))
+			{
+				if (!(name.attributes & obj_openif))
+					return STATUS_OBJECT_NAME_COLLISION;
+
+				if (!st->objs.get_object<event_pair_host>(existing))
+					return STATUS_OBJECT_TYPE_MISMATCH;
+
+				event_pair_handle.write(st->sys_proc->handle_table().create_handle(existing,
+					desired_access, inherit));
+
+				return STATUS_OBJECT_NAME_EXISTS;
+			}
+		}
+
+		const std::array<std::uint8_t, event_pair_body_size> zeroed{};
+		auto host = std::make_shared<event_pair_host>();
+		host->name = name.name;
+
+		const auto addr = st->objs.create_object(0, zeroed.data(), zeroed.size(), std::move(host),
+			prot_rw | prot_supervisor);
+
+		if (!addr)
+			return STATUS_INSUFFICIENT_RESOURCES;
+
+		auto& space = *st->emulator()->emu().default_addr_space();
+
+		win::init_dispatcher(emu_object<_KEVENT>(space, addr + event_pair_low_offset),
+			win::event_synchronization_object, 0);
+		win::init_dispatcher(emu_object<_KEVENT>(space, addr + event_pair_high_offset),
+			win::event_synchronization_object, 0);
+
+		if (name.named())
+			st->objs.register_named_object(name.key, addr);
+
+		const auto handle = st->sys_proc->handle_table().create_handle(addr, desired_access, inherit);
+
+		if (!handle)
+			return STATUS_INSUFFICIENT_RESOURCES;
+
+		event_pair_handle.write(handle);
+
+		THREAD_LOG_INFO("NtCreateEventPair('{}') -> handle=0x{:X}", name.name, handle);
+
+		return STATUS_SUCCESS;
+	};
+
+	state.redirect_ntzw(mod, "CreateEventPair", make_event_pair);
+
+	state.redirect_ntzw(mod, "OpenEventPair",
+		[st](vcpu& cpu, emu_object<std::uint64_t> event_pair_handle,
+			const std::uint32_t desired_access,
+			emu_object<_OBJECT_ATTRIBUTES> object_attributes) -> NTSTATUS
+		{
+			if (!event_pair_handle)
+				return STATUS_INVALID_PARAMETER;
+
+			event_pair_handle.write(0);
+
+			const auto name = resolve_object_name(*st, cpu, object_attributes);
+
+			if (name.status != STATUS_SUCCESS)
+				return name.status;
+
+			if (!name.named())
+				return STATUS_OBJECT_PATH_SYNTAX_BAD;
+
+			const auto existing = st->objs.lookup_named_object(name.key);
+
+			if (!existing)
+				return STATUS_OBJECT_NAME_NOT_FOUND;
+
+			if (!st->objs.get_object<event_pair_host>(existing))
+				return STATUS_OBJECT_TYPE_MISMATCH;
+
+			event_pair_handle.write(st->sys_proc->handle_table().create_handle(existing,
+				desired_access, (name.attributes & obj_inherit) ? win_handle_table::flag_inherit : 0));
+
+			return STATUS_SUCCESS;
+		});
+
+	// The two events of the pair a handle names, as addresses.
+	struct pair_events
+	{
+		NTSTATUS status = STATUS_SUCCESS;
+		addr_t low = 0;
+		addr_t high = 0;
+	};
+
+	const auto find_pair = [st](const std::uint64_t handle, const std::string_view who) -> pair_events
+	{
+		const auto entry = st->sys_proc->handle_table().lookup_handle(handle);
+
+		if (!entry)
+		{
+			THREAD_LOG_WARN("{}: handle 0x{:X} is not open", who, handle);
+			return { STATUS_INVALID_HANDLE };
+		}
+
+		if (!st->objs.get_object<event_pair_host>(entry->body_addr))
+		{
+			THREAD_LOG_WARN("{}: handle 0x{:X} is not an event pair", who, handle);
+			return { STATUS_OBJECT_TYPE_MISMATCH };
+		}
+
+		return { STATUS_SUCCESS, entry->body_addr + event_pair_low_offset,
+			entry->body_addr + event_pair_high_offset };
+	};
+
+	const auto signal_event = [st](vcpu& cpu, const addr_t event)
+	{
+		auto& space = *cpu.curr_addr_space();
+
+		win::set_state_at(space, event, 1);
+		st->sys_proc->wake_waiters(space, event);
+	};
+
+	// Nothing bounds the wait, as for the real call, and the scheduler overwrites the status once
+	// it decides the wait.
+	const auto wait_for_event = [](vcpu& cpu, const addr_t event) -> NTSTATUS
+	{
+		const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+
+		if (!t)
+			return STATUS_INVALID_PARAMETER;
+
+		win_thread::wait_state wait{};
+		wait.objects = { event };
+
+		t->begin_wait(std::move(wait));
+		t->try_satisfy(*cpu.curr_addr_space());
+
+		thread_scheduler::yield_current(cpu);
+
+		return STATUS_SUCCESS;
+	};
+
+	state.redirect_ntzw(mod, "SetLowEventPair",
+		[find_pair, signal_event](vcpu& cpu, const std::uint64_t handle) -> NTSTATUS
+		{
+			const auto pair = find_pair(handle, "NtSetLowEventPair");
+
+			if (pair.status == STATUS_SUCCESS)
+				signal_event(cpu, pair.low);
+
+			return pair.status;
+		});
+
+	state.redirect_ntzw(mod, "SetHighEventPair",
+		[find_pair, signal_event](vcpu& cpu, const std::uint64_t handle) -> NTSTATUS
+		{
+			const auto pair = find_pair(handle, "NtSetHighEventPair");
+
+			if (pair.status == STATUS_SUCCESS)
+				signal_event(cpu, pair.high);
+
+			return pair.status;
+		});
+
+	state.redirect_ntzw(mod, "WaitLowEventPair",
+		[find_pair, wait_for_event](vcpu& cpu, const std::uint64_t handle) -> NTSTATUS
+		{
+			const auto pair = find_pair(handle, "NtWaitLowEventPair");
+
+			return pair.status == STATUS_SUCCESS ? wait_for_event(cpu, pair.low) : pair.status;
+		});
+
+	state.redirect_ntzw(mod, "WaitHighEventPair",
+		[find_pair, wait_for_event](vcpu& cpu, const std::uint64_t handle) -> NTSTATUS
+		{
+			const auto pair = find_pair(handle, "NtWaitHighEventPair");
+
+			return pair.status == STATUS_SUCCESS ? wait_for_event(cpu, pair.high) : pair.status;
+		});
+
+	// The signal and the wait are one call, so nothing can come between them.
+	state.redirect_ntzw(mod, "SetLowWaitHighEventPair",
+		[find_pair, signal_event, wait_for_event](vcpu& cpu, const std::uint64_t handle) -> NTSTATUS
+		{
+			const auto pair = find_pair(handle, "NtSetLowWaitHighEventPair");
+
+			if (pair.status != STATUS_SUCCESS)
+				return pair.status;
+
+			signal_event(cpu, pair.low);
+
+			return wait_for_event(cpu, pair.high);
+		});
+
+	state.redirect_ntzw(mod, "SetHighWaitLowEventPair",
+		[find_pair, signal_event, wait_for_event](vcpu& cpu, const std::uint64_t handle) -> NTSTATUS
+		{
+			const auto pair = find_pair(handle, "NtSetHighWaitLowEventPair");
+
+			if (pair.status != STATUS_SUCCESS)
+				return pair.status;
+
+			signal_event(cpu, pair.high);
+
+			return wait_for_event(cpu, pair.low);
 		});
 }
