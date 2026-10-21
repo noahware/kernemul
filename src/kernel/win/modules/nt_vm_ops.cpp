@@ -841,6 +841,19 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 				: file_size)
 			: (static_cast<std::uint64_t>(max_size) + page_mask) & ~page_mask;
 
+		// A writable section larger than its file makes the file that large, as NtExtendSection does.
+		if (host->file && !host->is_image && static_cast<std::uint64_t>(max_size) > file_size)
+		{
+			try
+			{
+				host->file->resize(static_cast<std::size_t>(max_size));
+			}
+			catch (const std::exception&)
+			{
+				return STATUS_INSUFFICIENT_RESOURCES;
+			}
+		}
+
 		const auto size = static_cast<std::int64_t>(host->size);
 		const auto path = host->path;
 

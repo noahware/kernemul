@@ -171,18 +171,36 @@ void modules::register_ntoskrnl_token_ops(win_kernel_state& state, proc_module& 
 
 	state.privilege_enabled = [st, tokens](vcpu& cpu, const std::uint32_t luid) -> bool
 	{
+		const auto enabled_in = [luid](token_host& token)
+		{
+			std::scoped_lock lock(token.mtx);
+
+			return std::ranges::any_of(token.data.privileges,
+				[luid](const privilege_entry& p)
+				{
+					return p.luid == luid && (p.attributes & se_privilege_enabled);
+				});
+		};
+
 		const auto found = resolve_token(*st, *tokens, cpu, current_effective_token_pseudo_handle, 0);
 
 		if (found.status != STATUS_SUCCESS)
 			return false;
 
-		std::scoped_lock lock(found.token->mtx);
+		if (enabled_in(*found.token))
+			return true;
 
-		return std::ranges::any_of(found.token->data.privileges,
-			[luid](const privilege_entry& p)
-			{
-				return p.luid == luid && (p.attributes & se_privilege_enabled);
-			});
+		// Every thread starts out flagged as impersonating, which gives it a snapshot of the
+		// process token the first time anyone asks. A privilege enabled on the process token
+		// afterwards is not in that snapshot, but it is the one callers adjust.
+		const auto self = cpu.thread();
+
+		if (!self)
+			return false;
+
+		const auto process_token = tokens->for_process(self->proc()->id());
+
+		return process_token != found.token && enabled_in(*process_token);
 	};
 
 	const auto open_process_token = [st, tokens](vcpu& cpu, const std::uint64_t process_handle,

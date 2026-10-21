@@ -201,11 +201,21 @@ struct win_kernel_state : kernel_state
 		const auto zw = "Zw" + std::string(base);
 		const auto conv = emu_->call_conv();
 
-		const bool bound_nt = try_redirect(mod, nt, make_redirect(conv, fn));
-		const bool bound_zw = try_redirect(mod, zw, make_redirect(conv, fn));
+		const auto redirect_fn_ = make_redirect(conv, fn);
+
+		const bool bound_nt = try_redirect(mod, nt, redirect_fn_);
+		const bool bound_zw = try_redirect(mod, zw, redirect_fn_);
 
 		if (!bound_nt && !bound_zw)
+		{
 			LOG_ERR("neither {} nor {} is in {}", nt, zw, mod.name);
+			return;
+		}
+
+		// ntoskrnl folds the services it no longer implements into one body, so those names
+		// share an address that cannot say which of them was called; the number can.
+		named_syscalls_[nt] = redirect_fn_;
+		named_syscalls_[zw] = redirect_fn_;
 	}
 
 	std::shared_ptr<windows_process> create_dummy_process(addr_space& space,
@@ -304,6 +314,12 @@ struct win_kernel_state : kernel_state
 		const auto id = syscalls ? syscalls->id(cpu) : 0;
 		const auto handler = syscalls ? syscalls->find(id) : std::nullopt;
 		const auto* fn = handler ? find_redirect(*handler) : nullptr;
+
+		if (const auto name = syscalls ? syscalls->name(id) : std::string_view(); !name.empty())
+		{
+			if (const auto it = named_syscalls_.find(std::string(name)); it != named_syscalls_.end())
+				fn = &it->second;
+		}
 
 		if (!fn)
 		{
@@ -551,6 +567,7 @@ private:
 	std::deque<win_per_cpu> per_cpu_;
 
 	std::unordered_map<addr_t, addr_t> ldr_entries_;
+	std::unordered_map<std::string, redirect_fn> named_syscalls_;
 
 	emu_object<_EPROCESS> insert_process(addr_space& space, process::id_type id,
 		std::string_view name, addr_t peb_address = 0)
