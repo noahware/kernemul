@@ -119,6 +119,91 @@ bool win_registry::key_exists(const std::string_view path) const
 	return keys_.contains(std::string(path));
 }
 
+win_registry::rename_result win_registry::rename_key(const std::string_view path,
+	const std::string_view new_name)
+{
+	const auto old_path = std::string(path);
+
+	if (!keys_.contains(old_path))
+		return rename_result::not_found;
+
+	const auto slash = old_path.rfind('/');
+	std::string leaf(new_name);
+
+	for (auto& c : leaf)
+		c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+	const auto new_path = slash == std::string::npos ? leaf : old_path.substr(0, slash + 1) + leaf;
+
+	if (new_path == old_path)
+		return rename_result::renamed;
+
+	if (keys_.contains(new_path))
+		return rename_result::collision;
+
+	const auto old_prefix = old_path + "/";
+	std::vector<std::pair<std::string, std::shared_ptr<win_registry_key>>> moved;
+
+	for (auto it = keys_.begin(); it != keys_.end();)
+	{
+		if (it->first == old_path || it->first.starts_with(old_prefix))
+		{
+			moved.emplace_back(new_path + it->first.substr(old_path.size()), std::move(it->second));
+			it = keys_.erase(it);
+			continue;
+		}
+
+		++it;
+	}
+
+	for (auto& [moved_path, key] : moved)
+		keys_.emplace(std::move(moved_path), std::move(key));
+
+	++epoch_;
+
+	LOG_INFO("registry: renamed key '{}' to '{}'", old_path, new_path);
+
+	return rename_result::renamed;
+}
+
+std::size_t win_registry::delete_subtree(const std::string_view path)
+{
+	const auto root = std::string(path);
+	const auto prefix = root + "/";
+	std::size_t removed = 0;
+
+	for (auto it = keys_.begin(); it != keys_.end();)
+	{
+		if (it->first == root || it->first.starts_with(prefix))
+		{
+			it = keys_.erase(it);
+			++removed;
+			continue;
+		}
+
+		++it;
+	}
+
+	return removed;
+}
+
+void win_registry::adopt(win_registry& other)
+{
+	for (auto& [path, key] : other.keys_)
+		keys_.emplace(path, key);
+}
+
+std::optional<std::string> win_registry::path_of(const win_registry_key* const key) const
+{
+	for (const auto& [path, candidate] : keys_)
+	{
+		if (candidate.get() == key)
+			return path;
+	}
+
+	return std::nullopt;
+}
+
 std::vector<std::string> win_registry::enumerate_subkeys(const std::string_view parent_path) const
 {
 	const auto prefix = std::string(parent_path) + "/";

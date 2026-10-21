@@ -1,5 +1,7 @@
 #include "nt_reg_ops.hpp"
 #include "../win_kernel.hpp"
+#include "../file_common.hpp"
+#include "../hive.hpp"
 #include "../registry.hpp"
 #include "../status.hpp"
 #include "../string.hpp"
@@ -7,6 +9,8 @@
 #include "../../../util/log.hpp"
 #include "../../../util/string.hpp"
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <vector>
 #include <string_view>
 
@@ -17,6 +21,16 @@ struct registry_key_host final : win_object
 {
 	std::shared_ptr<win_registry_key> key;
 	std::string path;
+
+	// The rename count the path was last known good at.
+	std::uint64_t epoch = 0;
+};
+
+// Hives that were loaded from a file, and the file each one is written back to when it goes.
+struct loaded_hives
+{
+	std::mutex mtx;
+	std::map<std::string, std::string> sources;
 };
 
 enum key_information_class : std::uint32_t
@@ -126,6 +140,37 @@ struct rtl_query_registry_table_t
 
 #pragma pack(pop)
 
+#pragma pack(push, 8)
+struct key_value_entry_t
+{
+	std::uint64_t value_name;
+	std::uint32_t data_length;
+	std::uint32_t data_offset;
+	std::uint32_t type;
+	std::uint32_t padding;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(key_value_entry_t) == 0x18);
+
+constexpr std::uint32_t key_write_access = 0x20006;
+constexpr std::uint32_t generic_all_access = 0x10000000;
+constexpr std::uint32_t generic_write_access = 0x40000000;
+constexpr std::uint32_t maximum_allowed_access = 0x02000000;
+
+constexpr std::uint32_t se_backup_privilege = 17;
+constexpr std::uint32_t se_restore_privilege = 18;
+
+// REG_OPTION_BACKUP_RESTORE, REG_OPTION_OPEN_LINK and REG_OPTION_DONT_VIRTUALIZE.
+constexpr std::uint32_t open_options_mask = 0x1C;
+
+constexpr std::uint32_t reg_standard_format = 1;
+constexpr std::uint32_t reg_latest_format = 2;
+constexpr std::uint32_t reg_no_compression = 4;
+
+constexpr std::uint32_t max_value_entries = 65536;
+constexpr std::uint32_t max_rename_bytes = 512;
+
 static_assert(sizeof(key_basic_information_t) == 0x10);
 static_assert(sizeof(key_full_information_t) == 0x2C);
 static_assert(sizeof(key_value_basic_information_t) == 0x0C);
@@ -225,7 +270,43 @@ std::vector<std::uint8_t> value_response(const std::uint32_t info_class,
 std::shared_ptr<registry_key_host> key_from_handle(win_kernel_state& state,
 	const std::uint64_t handle)
 {
-	return state.sys_proc->handle_table().get_object<registry_key_host>(handle);
+	auto host = state.sys_proc->handle_table().get_object<registry_key_host>(handle);
+
+	// A rename moves a key out from under a handle opened on it, so the path the handle was
+	// opened by may have gone stale. Looking it up again costs a scan, so it is done only then.
+	if (host && host->epoch != state.reg.epoch())
+	{
+		if (const auto path = state.reg.path_of(host->key.get()))
+			host->path = *path;
+
+		host->epoch = state.reg.epoch();
+	}
+
+	return host;
+}
+
+bool allows_key_write(const std::uint32_t access)
+{
+	return (access & key_write_access) == key_write_access
+		|| (access & (generic_all_access | generic_write_access | maximum_allowed_access));
+}
+
+// Where a hive can be loaded: straight under the machine root, or under the user root.
+bool is_hive_slot(const std::string& path)
+{
+	constexpr std::string_view user_root = "registry/user/";
+
+	if (path.empty())
+		return false;
+
+	if (path.starts_with(user_root))
+	{
+		const auto name = path.substr(user_root.size());
+
+		return !name.empty() && name.find('/') == std::string::npos;
+	}
+
+	return path.find('/') == std::string::npos;
 }
 
 std::uint64_t open_key_handle(win_kernel_state& state, std::shared_ptr<win_registry_key> key,
@@ -234,6 +315,7 @@ std::uint64_t open_key_handle(win_kernel_state& state, std::shared_ptr<win_regis
 	auto host = std::make_shared<registry_key_host>();
 	host->key = std::move(key);
 	host->path = std::move(path);
+	host->epoch = state.reg.epoch();
 
 	const std::uint8_t body[sizeof(addr_t)] = {};
 	const auto addr = state.objs.create_object(0, body, sizeof(body),
@@ -620,9 +702,364 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 		return STATUS_SUCCESS;
 	};
 
+	// Nothing here makes a key that is not a plain key, so the link options have nothing to select.
+	auto open_key_ex = [open_key](vcpu& cpu, emu_object<std::uint64_t> key_handle,
+		const std::uint32_t desired_access, emu_object<_OBJECT_ATTRIBUTES> object_attributes,
+		const std::uint32_t open_options) -> NTSTATUS
+	{
+		if (key_handle)
+			key_handle.write(0);
+
+		if (open_options & ~open_options_mask)
+			return STATUS_INVALID_PARAMETER_4;
+
+		return open_key(cpu, key_handle, desired_access, object_attributes);
+	};
+
+	// A transaction is something NtCreateTransaction hands out, and nothing here does, so a handle
+	// that gets this far is one that is not a transaction. The key is not created in either case.
+	auto create_key_transacted = [st](vcpu&, emu_object<std::uint64_t> key_handle,
+		[[maybe_unused]] const std::uint32_t desired_access,
+		[[maybe_unused]] emu_object<_OBJECT_ATTRIBUTES> object_attributes,
+		[[maybe_unused]] const std::uint32_t title_index,
+		[[maybe_unused]] emu_object<_UNICODE_STRING> class_name,
+		[[maybe_unused]] const std::uint32_t create_options,
+		const std::uint64_t transaction_handle,
+		emu_object<std::uint32_t> disposition) -> NTSTATUS
+	{
+		if (key_handle)
+			key_handle.write(0);
+
+		if (disposition)
+			disposition.write(0);
+
+		if (!st->sys_proc->handle_table().lookup_handle(transaction_handle))
+			return STATUS_INVALID_HANDLE;
+
+		THREAD_LOG_WARN("NtCreateKeyTransacted: handle 0x{:X} is not a transaction, and nothing "
+			"here creates one", transaction_handle);
+
+		return STATUS_OBJECT_TYPE_MISMATCH;
+	};
+
+	auto rename_key = [st](vcpu&, const std::uint64_t key_handle,
+		emu_object<_UNICODE_STRING> new_name) -> NTSTATUS
+	{
+		const auto entry = st->sys_proc->handle_table().lookup_handle(key_handle);
+		const auto host = key_from_handle(*st, key_handle);
+
+		if (!entry || !host)
+			return STATUS_INVALID_HANDLE;
+
+		if (!new_name)
+			return STATUS_INVALID_PARAMETER;
+
+		if (!allows_key_write(entry->access))
+			return STATUS_ACCESS_DENIED;
+
+		const auto bytes = new_name.field(&_UNICODE_STRING::Length).read();
+		const auto name = win::read_unicode_string(new_name);
+
+		// A name is one component of 1 to 256 characters, with no separator and no leading NUL.
+		if (!bytes || bytes % sizeof(char16_t) || bytes > max_rename_bytes || name.empty()
+			|| name.front() == u'\0' || name.find(u'\\') != std::u16string::npos)
+			return STATUS_INVALID_PARAMETER;
+
+		// The top of the tree is not a key that has a parent to hold it under another name.
+		if (host->path.empty())
+			return STATUS_ACCESS_DENIED;
+
+		const auto narrow = narrow_wstring(name);
+
+		switch (st->reg.rename_key(host->path, narrow))
+		{
+		case win_registry::rename_result::renamed:
+			THREAD_LOG_INFO("NtRenameKey('{}') -> '{}'", host->path, narrow);
+			return STATUS_SUCCESS;
+
+		// A sibling of that name is reported as a failure to delete, not as a collision.
+		case win_registry::rename_result::collision:
+			return STATUS_CANNOT_DELETE;
+
+		case win_registry::rename_result::not_found:
+			return STATUS_KEY_DELETED;
+		}
+
+		return STATUS_UNSUCCESSFUL;
+	};
+
+	// Each value's data goes at a four byte boundary of the buffer, in the order they were asked for.
+	auto query_multiple_value_key = [st](vcpu& cpu, const std::uint64_t key_handle,
+		const addr_t value_entries, const std::uint32_t entry_count, const addr_t value_buffer,
+		emu_object<std::uint32_t> buffer_length,
+		emu_object<std::uint32_t> required_buffer_length) -> NTSTATUS
+	{
+		const auto host = key_from_handle(*st, key_handle);
+
+		if (!host)
+			return STATUS_INVALID_HANDLE;
+
+		if (!entry_count)
+		{
+			if (required_buffer_length)
+				required_buffer_length.write(0);
+
+			return STATUS_SUCCESS;
+		}
+
+		if (!value_entries || !buffer_length)
+			return STATUS_INVALID_PARAMETER;
+
+		if (entry_count > max_value_entries)
+			return STATUS_INSUFFICIENT_RESOURCES;
+
+		auto& space = *cpu.curr_addr_space();
+		const auto capacity = buffer_length.read();
+
+		if (capacity && !value_buffer)
+			return STATUS_INVALID_PARAMETER;
+
+		std::vector<const registry_value*> values;
+		values.reserve(entry_count);
+
+		for (std::uint32_t i = 0; i < entry_count; ++i)
+		{
+			const emu_object<key_value_entry_t> entry(space, value_entries + i * sizeof(key_value_entry_t));
+			auto name = win::read_unicode_string(
+				emu_object<_UNICODE_STRING>(space, static_cast<addr_t>(entry.read().value_name)));
+
+			while (!name.empty() && name.back() == u'\0')
+				name.pop_back();
+
+			const auto* const value = host->key->query_value(narrow_wstring(name));
+
+			// A name that is not there fails the call whether or not the rest would have fitted.
+			if (!value)
+			{
+				THREAD_LOG_INFO("NtQueryMultipleValueKey('{}'): no value '{}'", host->path,
+					narrow_wstring(name));
+				return STATUS_OBJECT_NAME_NOT_FOUND;
+			}
+
+			values.push_back(value);
+		}
+
+		std::vector<std::uint64_t> offsets;
+		std::uint64_t cursor = 0;
+
+		for (const auto* const value : values)
+		{
+			const auto offset = (cursor + 3) & ~std::uint64_t{3};
+
+			offsets.push_back(offset);
+			cursor = offset + value->data.size();
+		}
+
+		if (required_buffer_length)
+			required_buffer_length.write(static_cast<std::uint32_t>(cursor));
+
+		// Only values that fit whole are written, and only as a run from the first.
+		std::size_t fitting = 0;
+
+		while (fitting < values.size() && offsets[fitting] + values[fitting]->data.size() <= capacity)
+			++fitting;
+
+		for (std::size_t i = 0; i < values.size(); ++i)
+		{
+			emu_object<key_value_entry_t> slot(space, value_entries + i * sizeof(key_value_entry_t));
+			auto row = slot.read();
+
+			row.data_length = 0;
+			row.data_offset = 0;
+			row.type = 0;
+
+			if (i < fitting)
+			{
+				row.data_length = static_cast<std::uint32_t>(values[i]->data.size());
+				row.data_offset = static_cast<std::uint32_t>(offsets[i]);
+				row.type = static_cast<std::uint32_t>(values[i]->type);
+
+				if (!values[i]->data.empty())
+					space.write_mem(value_buffer + offsets[i], values[i]->data.data(),
+						values[i]->data.size());
+			}
+
+			slot.write(row);
+		}
+
+		THREAD_LOG_INFO("NtQueryMultipleValueKey('{}', {} value(s)) -> {} byte(s), {} fitted",
+			host->path, entry_count, cursor, fitting);
+
+		if (fitting != values.size())
+			return STATUS_BUFFER_OVERFLOW;
+
+		buffer_length.write(static_cast<std::uint32_t>(cursor));
+
+		return STATUS_SUCCESS;
+	};
+
+	const auto hives = std::make_shared<loaded_hives>();
+
+	// The file is read whole and the hive built from it, so it is not held open and nothing in it
+	// changes until the hive is unloaded.
+	auto load_hive = [st, hives](vcpu& cpu, emu_object<_OBJECT_ATTRIBUTES> target_key,
+		emu_object<_OBJECT_ATTRIBUTES> source_file) -> NTSTATUS
+	{
+		if (!target_key || !source_file)
+			return STATUS_INVALID_PARAMETER;
+
+		if (!(st->privilege_enabled && st->privilege_enabled(cpu, se_restore_privilege)))
+			return STATUS_PRIVILEGE_NOT_HELD;
+
+		const auto target = resolve_key_path(*st, *cpu.curr_addr_space(), target_key);
+
+		if (!is_hive_slot(target))
+			return STATUS_INVALID_PARAMETER;
+
+		const auto source = object_path(*st, cpu, source_file);
+		const auto file = st->fs.open(source);
+
+		if (!file)
+		{
+			THREAD_LOG_WARN("NtLoadKey('{}'): no hive file '{}'", target, source);
+			return STATUS_OBJECT_NAME_NOT_FOUND;
+		}
+
+		std::scoped_lock lock(hives->mtx);
+
+		if (st->reg.key_exists(target))
+			return STATUS_OBJECT_NAME_COLLISION;
+
+		switch (win::hive::load(st->reg, target, file->data()))
+		{
+		case win::hive::load_result::loaded:
+			break;
+
+		case win::hive::load_result::not_a_hive:
+			return STATUS_NOT_REGISTRY_FILE;
+
+		case win::hive::load_result::corrupt:
+			return STATUS_REGISTRY_CORRUPT;
+		}
+
+		hives->sources[target] = source;
+
+		THREAD_LOG_INFO("NtLoadKey('{}', '{}')", target, source);
+
+		return STATUS_SUCCESS;
+	};
+
+	// What was done to the hive while it was loaded goes back to the file it came from.
+	auto unload_hive = [st, hives](vcpu& cpu, emu_object<_OBJECT_ATTRIBUTES> target_key) -> NTSTATUS
+	{
+		if (!target_key)
+			return STATUS_INVALID_PARAMETER;
+
+		if (!(st->privilege_enabled && st->privilege_enabled(cpu, se_restore_privilege)))
+			return STATUS_PRIVILEGE_NOT_HELD;
+
+		const auto target = resolve_key_path(*st, *cpu.curr_addr_space(), target_key);
+
+		std::scoped_lock lock(hives->mtx);
+
+		if (!st->reg.key_exists(target))
+			return STATUS_OBJECT_NAME_NOT_FOUND;
+
+		const auto it = hives->sources.find(target);
+
+		if (it == hives->sources.end())
+			return STATUS_INVALID_PARAMETER;
+
+		const auto saved = win::hive::save(st->reg, target,
+			static_cast<std::uint64_t>(win_system_time()));
+
+		if (const auto file = st->fs.open(it->second))
+			file->write(saved);
+
+		const auto removed = st->reg.delete_subtree(target);
+
+		THREAD_LOG_INFO("NtUnloadKey('{}'): {} key(s), written back to '{}'", target, removed,
+			it->second);
+
+		hives->sources.erase(it);
+
+		return STATUS_SUCCESS;
+	};
+
+	auto save_key = [st](vcpu& cpu, const std::uint64_t key_handle, const std::uint64_t file_handle,
+		const std::uint32_t format) -> NTSTATUS
+	{
+		constexpr std::uint32_t file_write_data = 0x2;
+
+		if (format != reg_standard_format && format != reg_latest_format
+			&& format != reg_no_compression)
+			return STATUS_INVALID_PARAMETER;
+
+		if (!(st->privilege_enabled && st->privilege_enabled(cpu, se_backup_privilege)))
+			return STATUS_PRIVILEGE_NOT_HELD;
+
+		const auto key = key_from_handle(*st, key_handle);
+		const auto entry = st->sys_proc->handle_table().lookup_handle(file_handle);
+		const auto file = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+
+		if (!key || !entry || !file)
+			return STATUS_INVALID_HANDLE;
+
+		if (file->is_device() || file->console || !file->file)
+			return STATUS_INVALID_DEVICE_REQUEST;
+
+		if (file->directory)
+			return STATUS_FILE_IS_A_DIRECTORY;
+
+		if (!(entry->access & file_write_data))
+			return STATUS_ACCESS_DENIED;
+
+		const auto saved = win::hive::save(st->reg, key->path,
+			static_cast<std::uint64_t>(win_system_time()));
+
+		file->file->write(saved);
+
+		THREAD_LOG_INFO("NtSaveKey('{}', format={}) -> '{}', {} byte(s)", key->path, format,
+			file->path, saved.size());
+
+		return STATUS_SUCCESS;
+	};
+
 	// Nt and Zw are one function at one address here, so both names bind to one handler.
 	state.redirect_ntzw(mod, "CreateKey", create_key);
 	state.redirect_ntzw(mod, "OpenKey", open_key);
+	state.redirect_ntzw(mod, "OpenKeyEx", open_key_ex);
+	state.redirect_ntzw(mod, "CreateKeyTransacted", create_key_transacted);
+	state.redirect_ntzw(mod, "RenameKey", rename_key);
+	state.redirect_ntzw(mod, "QueryMultipleValueKey", query_multiple_value_key);
+
+	state.redirect_ntzw(mod, "LoadKey", load_hive);
+
+	state.redirect_ntzw(mod, "LoadKey2",
+		[load_hive](vcpu& cpu, emu_object<_OBJECT_ATTRIBUTES> target_key,
+			emu_object<_OBJECT_ATTRIBUTES> source_file, [[maybe_unused]] const std::uint32_t flags)
+			-> NTSTATUS
+		{
+			return load_hive(cpu, target_key, source_file);
+		});
+
+	state.redirect_ntzw(mod, "UnloadKey", unload_hive);
+
+	state.redirect_ntzw(mod, "UnloadKey2",
+		[unload_hive](vcpu& cpu, emu_object<_OBJECT_ATTRIBUTES> target_key,
+			[[maybe_unused]] const std::uint32_t flags) -> NTSTATUS
+		{
+			return unload_hive(cpu, target_key);
+		});
+
+	state.redirect_ntzw(mod, "SaveKey",
+		[save_key](vcpu& cpu, const std::uint64_t key_handle, const std::uint64_t file_handle)
+			-> NTSTATUS
+		{
+			return save_key(cpu, key_handle, file_handle, reg_standard_format);
+		});
+
+	state.redirect_ntzw(mod, "SaveKeyEx", save_key);
 	state.redirect_ntzw(mod, "QueryKey", query_key);
 	state.redirect_ntzw(mod, "EnumerateKey", enumerate_key);
 	state.redirect_ntzw(mod, "QueryValueKey", query_value_key);

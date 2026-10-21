@@ -212,6 +212,8 @@ set(kernemul_SOURCES
 	"src/kernel/win/file_common.hpp"
 	"src/kernel/win/filesystem.cpp"
 	"src/kernel/win/filesystem.hpp"
+	"src/kernel/win/hive.cpp"
+	"src/kernel/win/hive.hpp"
 	"src/kernel/win/irp.hpp"
 	"src/kernel/win/ldr.hpp"
 	"src/kernel/win/linked_list.hpp"
