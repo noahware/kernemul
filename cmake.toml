@@ -153,10 +153,43 @@ windows.compile-definitions = ["NOMINMAX"]
 # that has to be told.
 gnu.compile-options = ["-Wno-changes-meaning", "-mms-bitfields"]
 # The logging macros use __VA_OPT__, which only msvc's conformant preprocessor has.
-msvc.compile-options = ["/Zc:preprocessor"]
+# /MP because the Visual Studio generator otherwise compiles one file at a time.
+msvc.compile-options = ["/Zc:preprocessor", "/MP"]
+# types.hpp is ~40k generated lines and reaches nearly every TU through
+# win_kernel.hpp, which made it most of each file's compile time. win_kernel.hpp
+# itself stays out: it changes with every new handler and would rebuild the pch.
+precompile-headers = [
+	"src/kernel/win/types.hpp",
+	"src/util/log.hpp",
+	"<cstdint>",
+	"<cstring>",
+	"<deque>",
+	"<filesystem>",
+	"<functional>",
+	"<memory>",
+	"<string>",
+	"<string_view>",
+	"<unordered_map>",
+	"<vector>",
+]
 arch-x64.compile-definitions = ["KERNEMUL_ARCH_X64=1"]
 arch-arm64.compile-definitions = ["KERNEMUL_ARCH_ARM64=1"]
 whp.sources = ["vendor/hypermulator/src/**.cpp", "vendor/hypermulator/src/**.hpp"]
 whp.include-directories = ["vendor/hypermulator/src"]
 whp.link-libraries = ["Zydis::Zydis", "WinHvPlatform"]
 whp.compile-definitions = ["KERNEMUL_HAS_WHP=1"]
+# Files that see <windows.h> -- unicorn's header, beast's asio (through
+# sym/pdb.hpp) and hypermulator all include it -- have to skip the pch: its
+# _LIST_ENTRY, _LARGE_INTEGER, ULONG and the rest collide with the generated types.
+cmake-after = """
+set(kernemul_no_pch_SOURCES
+	"src/emu/guest_emu.cpp"
+	"src/emu/x86/unicorn_cpu_ident.cpp"
+	"src/kernel/process.cpp"
+)
+if(KERNEMUL_BACKEND STREQUAL "whp")
+	file(GLOB_RECURSE kernemul_hypermulator_SOURCES CONFIGURE_DEPENDS "vendor/hypermulator/src/*.cpp")
+	list(APPEND kernemul_no_pch_SOURCES ${kernemul_hypermulator_SOURCES} "src/emu/x86/whp.cpp")
+endif()
+set_source_files_properties(${kernemul_no_pch_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+"""

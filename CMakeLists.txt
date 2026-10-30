@@ -415,6 +415,7 @@ endif()
 if(MSVC) # msvc
 	target_compile_options(kernemul PRIVATE
 		"/Zc:preprocessor"
+		"/MP"
 	)
 endif()
 
@@ -452,7 +453,34 @@ if(KERNEMUL_BACKEND STREQUAL "whp") # whp
 	)
 endif()
 
+target_precompile_headers(kernemul PRIVATE
+	"src/kernel/win/types.hpp"
+	"src/util/log.hpp"
+	"<cstdint>"
+	"<cstring>"
+	"<deque>"
+	"<filesystem>"
+	"<functional>"
+	"<memory>"
+	"<string>"
+	"<string_view>"
+	"<unordered_map>"
+	"<vector>"
+)
+
 get_directory_property(CMKR_VS_STARTUP_PROJECT DIRECTORY ${PROJECT_SOURCE_DIR} VS_STARTUP_PROJECT)
 if(NOT CMKR_VS_STARTUP_PROJECT)
 	set_property(DIRECTORY ${PROJECT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT kernemul)
 endif()
+
+set(CMKR_TARGET kernemul)
+set(kernemul_no_pch_SOURCES
+	"src/emu/guest_emu.cpp"
+	"src/emu/x86/unicorn_cpu_ident.cpp"
+	"src/kernel/process.cpp"
+)
+if(KERNEMUL_BACKEND STREQUAL "whp")
+	file(GLOB_RECURSE kernemul_hypermulator_SOURCES CONFIGURE_DEPENDS "vendor/hypermulator/src/*.cpp")
+	list(APPEND kernemul_no_pch_SOURCES ${kernemul_hypermulator_SOURCES} "src/emu/x86/whp.cpp")
+endif()
+set_source_files_properties(${kernemul_no_pch_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
