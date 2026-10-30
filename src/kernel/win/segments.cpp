@@ -191,6 +191,9 @@ cpu_tables init_vcpu(vcpu& cpu, const proc_module& ntoskrnl)
 
 	cpu.reg(x86::ldtr, x86::seg_reg{});
 
+	// Neither backend enters through it, but a guest reads it to find KiSystemCall64.
+	cpu.reg(x86::lstar, ntoskrnl.find_symbol("KiSystemCall64").value_or(0));
+
 	return { gdt_va, tss_va, init_idt(cpu, ntoskrnl) };
 }
 
