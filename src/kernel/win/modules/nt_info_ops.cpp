@@ -182,6 +182,22 @@ void modules::register_ntoskrnl_info_ops(win_kernel_state& state, proc_module& m
 			return id;
 		});
 
+	state.redirect(mod, "PsGetThreadProcessId",
+		[](vcpu&, emu_object<_ETHREAD> thread) -> addr_t
+		{
+			if (!thread)
+			{
+				THREAD_LOG_WARN("PsGetThreadProcessId: null thread");
+				return 0;
+			}
+
+			const auto id = guest_va(thread.field(&_ETHREAD::Cid).field(&_CLIENT_ID::UniqueProcess).read());
+
+			THREAD_LOG_INFO("PsGetThreadProcessId(0x{:X}) -> {}", thread.address(), id);
+
+			return id;
+		});
+
 	// PsGetCurrentProcessId is the same export folded to one address on both architectures.
 	auto current_process_id = [st](vcpu& cpu) -> addr_t
 	{
