@@ -4,6 +4,7 @@
 #include "../per_cpu.hpp"
 #include "../user_setup.hpp"
 #include "../string.hpp"
+#include "../service_table.hpp"
 #include "../../../util/log.hpp"
 
 #include <cstddef>
@@ -86,6 +87,40 @@ addr_t init_list_head(addr_space& space, const proc_module& mod, const std::stri
 		space.write_mem(va, guest_links(va, va));
 
 	return va;
+}
+
+// What KiInitializeKernel and KiInitSystem do at boot: the image ships KiServiceTable as rvas,
+// compacted in place to (offset from the table << 4) | stack argument dwords.
+void init_service_tables(addr_space& space, const proc_module& mod)
+{
+	const auto table = mod.find_symbol("KiServiceTable");
+	const auto limit_va = mod.find_symbol("KiServiceLimit");
+	const auto args = mod.find_symbol("KiArgumentTable");
+
+	if (!table || !limit_va || !args)
+	{
+		LOG_INFO("no service table symbols in {}, so KeServiceDescriptorTable stays empty",
+			mod.name);
+		return;
+	}
+
+	const auto limit = space.read_mem<std::uint32_t>(*limit_va);
+	const auto table_rva = static_cast<std::uint32_t>(*table - mod.addr);
+
+	for (std::uint32_t i = 0; i < limit; ++i)
+	{
+		const auto entry = *table + i * sizeof(std::uint32_t);
+		const auto rva = space.read_mem<std::uint32_t>(entry);
+		const auto arg_bytes = space.read_mem<std::uint8_t>(*args + i);
+
+		space.write_mem<std::uint32_t>(entry, ((rva - table_rva) << 4) | (arg_bytes >> 2));
+	}
+
+	const service_table_descriptor_t descriptor{ .base = *table, .limit = limit, .number = *args };
+
+	for (const auto name : { "KeServiceDescriptorTable", "KeServiceDescriptorTableShadow",
+		"KeServiceDescriptorTableFilter" })
+		write_global(space, mod, name, descriptor, false);
 }
 
 // KdDebuggerDataBlock is where a driver looks for what ntoskrnl never exports, PteBase above
@@ -322,6 +357,7 @@ void modules::init_ntoskrnl_globals(win_kernel_state& state, proc_module& mod)
 	}
 
 	init_debugger_data(space, mod);
+	init_service_tables(space, mod);
 
 	// The four ObGetObjectType can name, so that reading a type back gives the same pointer the
 	// global holds rather than null.
