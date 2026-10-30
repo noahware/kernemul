@@ -25,6 +25,14 @@ void modules::register_ntoskrnl_crt_ops(win_kernel_state& state, proc_module& mo
 {
 	auto* st = &state;
 
+	// The stack probe only touches pages and preserves every register; guest stacks are already mapped.
+	// Absent from ARM64, whose kernel exports only __chkstk.
+	if (mod.find_symbol("_alloca_probe"))
+		state.redirect(mod, "_alloca_probe", [](vcpu&)
+		{
+			THREAD_LOG_INFO("_alloca_probe");
+		});
+
 	state.redirect(mod, "wcslen", [](vcpu&, std::u16string str) -> std::uint64_t
 	{
 		THREAD_LOG_INFO("wcslen('{}') -> {}", narrow_wstring(str), str.size());
