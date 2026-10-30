@@ -74,6 +74,17 @@ void modules::register_fltmgr(win_kernel_state& state, proc_module& mod)
 	state.redirect(mod, "FltAcquirePushLockShared", push_lock);
 	state.redirect(mod, "FltReleasePushLock", push_lock);
 
+	state.redirect(mod, "FltGetRoutineAddress",
+		[&mod](vcpu&, std::string flt_mgr_routine_name) -> addr_t
+		{
+			const auto addr = mod.find_symbol(flt_mgr_routine_name);
+
+			THREAD_LOG_INFO("FltGetRoutineAddress('{}') -> 0x{:X}",
+				flt_mgr_routine_name, addr.value_or(0));
+
+			return addr.value_or(0);
+		});
+
 	state.redirect(mod, "FltRegisterFilter",
 		[st](vcpu& cpu, const addr_t driver_object, emu_object<void> registration,
 			emu_object<addr_t> ret_filter) -> NTSTATUS
