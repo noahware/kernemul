@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstring>
 #include <format>
+#include <intrin.h>
 #include <limits>
 #include <optional>
 #include <ranges>
@@ -18,6 +19,14 @@ namespace
 {
 
 constexpr std::size_t page_size = hm::emu::page_size;
+
+bool host_has_umip()
+{
+	int regs[4]{};
+	__cpuidex(regs, 7, 0);
+
+	return (static_cast<std::uint32_t>(regs[2]) & (1u << 2)) != 0;
+}
 
 addr_t page_align(const addr_t addr)
 {
@@ -142,6 +151,8 @@ hm::hook_insn_t to_hm_insn(const hook_insn_t insn)
 
 // IA32_EFER.SCE. Clear, and syscall is #UD rather than an entry through LSTAR.
 constexpr std::uint64_t efer_sce = 1;
+
+constexpr std::uint64_t cr4_umip = 1ull << 11;
 
 constexpr std::uint8_t syscall_insn[] = { 0x0F, 0x05 };
 
@@ -289,6 +300,10 @@ void x86_whp_vcpu::reg_write(const reg_t reg, const void* const value, const std
 
 	std::uint64_t raw{};
 	std::memcpy(&raw, value, std::min(size, sizeof(raw)));
+
+	// WHP rejects a CR4 bit the host cpu lacks instead of ignoring it as the hardware would.
+	if (reg == x86::cr4 && !host_has_umip())
+		raw &= ~cr4_umip;
 
 	// Whatever stepping is under way outlives this write: the value going in never carries a
 	// trap flag of its own, since reg_read took it out of the one it came from.
