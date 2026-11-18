@@ -39,6 +39,28 @@ void modules::register_ntoskrnl_crt_ops(win_kernel_state& state, proc_module& mo
 		return str.size();
 	});
 
+	state.redirect( mod, "_strlwr",
+		[] ( vcpu& cpu, const addr_t str ) -> addr_t
+		{
+			if ( !str )
+				return 0;
+	
+			auto& space = *cpu.curr_addr_space();
+			auto text = guest::read_string( space, str );
+	
+			std::transform( text.begin(), text.end(), text.begin(),
+				[] ( const char c ) -> char
+				{
+					return static_cast< char >( std::tolower( static_cast< unsigned char >( c ) ) );
+				} );
+	
+			space.write_mem( str, text.c_str(), text.size() + 1 );
+	
+			THREAD_LOG_INFO( "_strlwr(0x{:X}) -> '{}'", str, text );
+	
+			return str;
+		} );
+
 	state.redirect(mod, "strcmp",
 		[](vcpu&, std::string str1, std::string str2) -> std::int32_t
 		{
